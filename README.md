@@ -144,7 +144,7 @@ claude plugin validate .claude-plugin/plugin.json
 claude plugin test .
 ```
 
-The [116 tests](tests/register.test.ts) use a mock clock and engine. They cover:
+The [117 tests](tests/register.test.ts) use a mock clock and engine. They cover:
 
 - **Guard:** refuse once and resend, warn mode, slash commands, small contexts, prompts nobody typed, resume seeding and cold-write scoring.
 - **Warming:** command defaults and refused windows and periods, always/off, always after `/clear`, idle resets, usage-based stopping, cold-window expiry and delayed timers after sleep.

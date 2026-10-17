@@ -72,6 +72,7 @@ export type State = {
   retries: number
   retryReason: string
   gen: number
+  tick: number
   inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
 }
@@ -197,9 +198,11 @@ function updateStatus($: EngineInterface, s: State, now: number) {
   else $.ui.status(statusText(s, now))
 }
 
+/** Cancels the timer. Every new timer is set right after this, so the tick also says the schedule changed. */
 function disarm(s: State) {
   if (s.pending) s.pending.cancel()
   s.pending = null
+  s.tick++
 }
 
 /** Outdates any ping in flight: /clear, a resume, compaction or stop replaced the state it was sent for. Re-arming or extending the window does not, so a ping out at that moment still counts; a main request outdates it through the request clock. */
@@ -273,7 +276,10 @@ async function arm($: EngineInterface, s: State) {
 async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
+  const tick = s.tick
   const now = await $.clock.now()
+  // A timer set or cancelled while the clock was read (an extension, a retry, a turn) owns the window now.
+  if (s.tick !== tick) return
   // One fork at a time: the one already out re-arms when it settles. Checked after the await, and set
   // below with no await in between, so two timers can never both send.
   if (s.inFlight) return
@@ -376,7 +382,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, inFlight: false, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, inFlight: false, stepWrites: null,
   }
 }
 

@@ -1404,3 +1404,42 @@ describe('one timer at a time', () => {
     expect(w.forks.length).toBe(2)
   })
 })
+
+describe('a paused ping yields to a newer schedule', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a ping paused on the clock does not send after a newer ping set a retry', async ($, on) => {
+    let now = START
+    let holdNext = false
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => { releaseClock = r })
+      }
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    const w = world(on, [busy, busy, busy, busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A pauses on its clock read.
+    holdNext = true
+    timers.at(-1)?.()
+    await settle()
+    // The extension sets timer B; B pings, gets a 429 and schedules a one-minute retry.
+    await $.command.run(run('keepwarm', '6h'))
+    now += 1000
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+    releaseClock()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+  })
+})
