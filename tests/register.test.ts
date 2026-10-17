@@ -1443,3 +1443,60 @@ describe('a paused ping yields to a newer schedule', () => {
     expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
   })
 })
+
+describe('/clear overlapping /keepwarm', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a window armed while /clear is still running keeps a timer', async ($, on) => {
+    let now = START
+    let hold: Promise<void> | null = null
+    const holdNextRead = () => {
+      let release = () => {}
+      hold = new Promise<void>(r => { release = r })
+      return () => release()
+    }
+    const timers: Array<() => void> = []
+    const waits: number[] = []
+    on('clock.now', async () => {
+      const h = hold
+      hold = null
+      if (h) await h
+      return { value: now }
+    })
+    on('clock.after', ($, e) => new Promise<{ value: void }>(r => { waits.push(e.ms); timers.push(() => r({ value: undefined })) }))
+    const w = world(on, [warm, warm])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A fires and pauses on its clock read.
+    const releaseA = holdNextRead()
+    timers.at(-1)?.()
+    await settle()
+    // /clear stops the old window and pauses on its last clock read.
+    const releaseClear = holdNextRead()
+    const clearing = $.classic.SessionStart({ source: 'clear' })
+    await settle()
+    // /keepwarm arms a new window meanwhile; then /clear finishes.
+    await $.command.run(run('keepwarm', '6h'))
+    const beforeClearEnds = timers.length
+    releaseClear()
+    await clearing
+    await settle()
+    // /clear cancelled the window's timer in its reset, so it must set a new one: the wake at the deadline,
+    // since the new conversation has no request yet.
+    expect(timers.length).toBe(beforeClearEnds + 1)
+    expect(waits.at(-1)).toBe(6 * HOUR)
+    // A wakes, finds the schedule changed and a timer in place, and sends nothing.
+    releaseA()
+    await settle()
+    expect(w.forks.length).toBe(0)
+    expect(timers.length).toBe(beforeClearEnds + 1)
+    // The first turn of the new conversation starts the pings as usual.
+    await $.turn.complete(turn())
+    now += 50 * MIN
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+  })
+})

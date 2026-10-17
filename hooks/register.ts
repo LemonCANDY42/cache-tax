@@ -278,8 +278,9 @@ async function ping($: EngineInterface, s: State) {
   if (!s.deadline) return
   const tick = s.tick
   const now = await $.clock.now()
-  // A timer set or cancelled while the clock was read (an extension, a retry, a turn) owns the window now.
-  if (s.tick !== tick) return
+  // A timer set or cancelled while the clock was read (an extension, a retry, a turn) owns the window now;
+  // if that left no timer, a window still open is armed again rather than left without one.
+  if (s.tick !== tick) return s.pending || s.inFlight ? undefined : arm($, s)
   // One fork at a time: the one already out re-arms when it settles. Checked after the await, and set
   // below with no await in between, so two timers can never both send.
   if (s.inFlight) return
@@ -483,6 +484,8 @@ export const register: Register = on => {
       s.sid = await $.session.id()
       // No session.start fires after /clear, so this is where always arms the new conversation.
       if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      // A window armed while this handler awaited lost its timer to resetForClear; arm it again.
+      else if (s.deadline) await arm($, s)
       else updateStatus($, s, await $.clock.now())
       return r
     }
