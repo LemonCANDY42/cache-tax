@@ -4,6 +4,7 @@ import { statusIcons } from './status-icons'
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
+const MAX_RETRIES = 3
 const AUTO_WARM_MS = 3 * 60 * 60 * 1000
 const DEFAULT_WINDOW_MS = 6 * 60 * 60 * 1000
 const BIG_TOKENS = 50000
@@ -61,6 +62,8 @@ export type State = {
   pending: { cancel: () => void } | null
   last: PingRecord | null
   stopped: string | null
+  waitForTurn: boolean
+  retries: number
 }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
@@ -148,6 +151,7 @@ export function resetForClear(s: State) {
   s.ackedAt = 0
   s.coldWritePending = false
   s.misses = []
+  s.waitForTurn = false
   disarm(s)
 }
 
@@ -170,6 +174,8 @@ function statusText(s: State, now: number): string | undefined {
   const nextText = !s.lastRequestAt ? ' · waiting for the first turn'
     : s.compacted ? ' · waiting for the first turn after compaction'
     : isCold(s, now) ? ` · cold now, first ping ${fmtDuration(s.every)} after the next turn`
+    : s.waitForTurn ? ' · nothing to fork yet, first ping after the next turn'
+    : s.retries ? ` · API busy, ping retry ${s.retries} of ${MAX_RETRIES}`
     : ` · ping in ${fmtDuration(s.lastRequestAt + s.every - now)}`
   return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
 }
@@ -210,6 +216,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
+  s.retries = 0
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
@@ -222,11 +229,12 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
 
 async function arm($: EngineInterface, s: State) {
   disarm(s)
+  s.retries = 0
   if (!s.deadline) return
   const now = await $.clock.now()
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
-  if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
+  if (s.lastRequestAt && !s.compacted && !s.waitForTurn && !isCold(s, now)) {
     const untilCold = s.lastRequestAt + TTL_MS - now
     const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
     s.pending = $.clock.after(delay, () => { void ping($, s) })
@@ -252,11 +260,26 @@ async function ping($: EngineInterface, s: State) {
   }
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
   if (reply.isAnswered === false) {
-    const reason = reply.reason === 'nothing-to-fork' ? 'no conversation to warm yet'
-      : reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
+    // A restarted process has no conversation to fork until its first turn; the window waits for one instead of ending.
+    if (reply.reason === 'nothing-to-fork') {
+      s.waitForTurn = true
+      return arm($, s)
+    }
+    // A busy or failing API is usually brief; retry while a ping can still land a minute before the cache goes cold.
+    if (reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)) {
+      const at = await $.clock.now()
+      const wait = MIN_PING_MS * 2 ** s.retries
+      if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
+        s.retries++
+        s.pending = $.clock.after(wait, () => { void ping($, s) })
+        updateStatus($, s, at)
+        return
+      }
+    }
+    const reason = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
       : reply.reason === 'aborted' ? 'the ping was interrupted'
       : 'the ping returned no text'
-    return stop($, s, reason)
+    return stop($, s, reason + (s.retries ? ` after ${s.retries} ${s.retries === 1 ? 'retry' : 'retries'}` : ''))
   }
   const u = reply.usage
   const price = priceOf(s.lastModel, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
@@ -310,6 +333,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    waitForTurn: false, retries: 0,
   }
 }
 
@@ -474,8 +498,10 @@ export const register: Register = on => {
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
-    if (s.guard === 'warn') {
-      $.ui.log(`${guardText(s, now)} Sending anyway; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+    // Only a person can send a dropped prompt again; a task notification, a schedule or a peer's message would be lost.
+    const typed = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (s.guard === 'warn' || !typed) {
+      $.ui.log(`${guardText(s, now)} Sending anyway${typed ? '' : `, since a ${e.origin.kind} prompt cannot be sent again`}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -502,6 +528,7 @@ export const register: Register = on => {
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
     if (now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
+    s.waitForTurn = false
     s.ackedAt = 0
     const u = e.usage
     if (u) {

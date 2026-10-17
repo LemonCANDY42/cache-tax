@@ -280,8 +280,7 @@ describe('cache indicator', () => {
   })
 
   for (const failure of [
-    { isAnswered: false, reason: 'nothing-to-fork' },
-    { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() },
+    { isAnswered: false, reason: 'api-error', status: 400, error: 'invalid_request', usage: usage() },
     { isAnswered: false, reason: 'empty-reply', usage: usage() },
     { isAnswered: false, reason: 'aborted', usage: usage() },
   ] satisfies ModelForkResult[]) {
@@ -942,5 +941,100 @@ describe('always after /clear', () => {
     await $.turn.complete(turn())
     await clock.advance(50 * MIN)
     expect(w.forks.length).toBe(0)
+  })
+})
+
+describe('guard by origin', () => {
+  for (const kind of ['task-notification', 'scheduled-trigger', 'peer', 'sdk'] as const) {
+    test(`a cold ${kind} prompt is sent and scored, and the next typed prompt is still refused`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      const r = await $.prompt.submit({ text: 'agent finished', wait: false, origin: { kind } })
+      expect(r.drop).toBe(undefined)
+      expect(w.entered).toEqual(['agent finished'])
+      expect(w.logs.at(-1)).toMatch(new RegExp(`Sending anyway, since a ${kind} prompt cannot be sent again`))
+      await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+      expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid/)
+      await $.command.run(run('keepwarm', 'off'))
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/^cache-tax: the prompt cache went cold/)
+    })
+  }
+
+  test('a cold prompt from the Remote Control bridge is refused like a typed one', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    expect((await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'bridge' } })).drop).toMatch(/^cache-tax:/)
+  })
+})
+
+describe('ping failures', () => {
+  test('after a restart with nothing to fork, the window waits for the next turn instead of stopping', async ($, on) => {
+    const clock = mock.clock(on, { now: 10 * HOUR })
+    const store = new Map<string, unknown>([['deadline:S1', 13 * HOUR]])
+    const w = world(on, [{ isAnswered: false, reason: 'nothing-to-fork' }, warm], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 40 * 60, context_tokens: 200000 })
+    await clock.advance(10 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm 2h50m left · nothing to fork yet, first ping after the next turn')
+    expect(store.get('deadline:S1')).toBe(13 * HOUR)
+    await clock.advance(HOUR)
+    expect(w.forks.length).toBe(1)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  for (const status of [429, 529, 500, null]) {
+    test(`an API error ${status} is retried and the loop goes on once a ping lands`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const busy: ForkAnswer = { isAnswered: false, reason: 'api-error', status, error: 'rate_limit', usage: usage() }
+      const w = world(on, [busy, warm, warm])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await $.command.run(run('keepwarm', '3h'))
+      await clock.advance(50 * MIN)
+      expect(w.forks.length).toBe(1)
+      expect(w.status.at(-1)).toBe('keepwarm 2h10m left · API busy, ping retry 1 of 3')
+      await clock.advance(MIN)
+      expect(w.forks.length).toBe(2)
+      expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+      await clock.advance(50 * MIN)
+      expect(w.forks.length).toBe(3)
+    })
+  }
+
+  test('a lasting 429 stops after three retries, before the cache goes cold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const busy: ForkAnswer = { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() }
+    const w = world(on, [busy, busy, busy, busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(57 * MIN)
+    expect(w.forks.length).toBe(4)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: the API call failed (429) after 3 retries')
+    await clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(4)
+  })
+
+  test('a retry that would land within a minute of the cache going cold is not tried', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const busy: ForkAnswer = { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() }
+    const w = world(on, [busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h every 58m'))
+    await clock.advance(58 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: the API call failed (429)')
   })
 })
