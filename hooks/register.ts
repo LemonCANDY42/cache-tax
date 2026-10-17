@@ -14,6 +14,11 @@ const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
 
+// Prompts no person sent, so nobody could send them again after a refusal. Every
+// other origin, including sdk, unclassified and the owner's own Slack or channel
+// messages, may carry a person's words and keeps the guard.
+const UNATTENDED = new Set(['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity'])
+
 const LONG_PROMPT_TOKENS = 100000
 
 // $ per million tokens, [cache read, 1h cache write, output], list prices October 2026.
@@ -33,6 +38,7 @@ const PRICES: Array<[string | RegExp, number, number, number]> = [
   ['sonnet', 0.3, 6, 15],
   ['haiku-5-5', 0.01, 0.2, 0.5],
   ['3-5-haiku', 0.08, 1.6, 4],
+  ['haiku-3-5', 0.08, 1.6, 4],
   ['haiku', 0.1, 2, 5],
 ]
 
@@ -64,6 +70,8 @@ export type State = {
   stopped: string | null
   waitForTurn: boolean
   retries: number
+  retryReason: string
+  gen: number
 }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
@@ -185,9 +193,11 @@ function updateStatus($: EngineInterface, s: State, now: number) {
   else $.ui.status(statusText(s, now))
 }
 
+/** Cancels the timer and outdates any ping in flight, whose reply must not touch the state that replaced it. */
 function disarm(s: State) {
   if (s.pending) s.pending.cancel()
   s.pending = null
+  s.gen++
 }
 
 // The window and its ping period belong to the session that armed them, so a
@@ -234,10 +244,14 @@ async function arm($: EngineInterface, s: State) {
   const now = await $.clock.now()
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
-  if (s.lastRequestAt && !s.compacted && !s.waitForTurn && !isCold(s, now)) {
+  if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
     const untilCold = s.lastRequestAt + TTL_MS - now
-    const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
-    s.pending = $.clock.after(delay, () => { void ping($, s) })
+    // Waiting for a turn sends nothing, but wakes when the cache goes cold so the row says so.
+    if (s.waitForTurn) s.pending = $.clock.after(Math.min(s.deadline - now, untilCold), () => { void arm($, s) })
+    else {
+      const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
+      s.pending = $.clock.after(delay, () => { void ping($, s) })
+    }
   } else {
     s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
   }
@@ -251,13 +265,20 @@ async function ping($: EngineInterface, s: State) {
   if (now >= s.deadline) return arm($, s)
   // A turn in the meantime re-armed the timer; this callback is stale.
   if (isCold(s, now)) return arm($, s)
+  if (s.compacted || s.waitForTurn || !s.lastRequestAt) return arm($, s)
   if (now - s.lastRequestAt < s.every - 1000) return
+  // A host that slept past a retry's slot must not send it inside the last minute.
+  if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
+  const gen = s.gen
   let reply
   try {
     reply = await $.model.fork({ prompt: PING_PROMPT })
   } catch (err) {
+    if (gen !== s.gen) return
     return stop($, s, `the ping failed, ${err instanceof Error ? err.message : String(err)}`)
   }
+  // A turn, /clear, compaction or stop while the fork was out has replaced the state it was sent for.
+  if (gen !== s.gen) return
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
   if (reply.isAnswered === false) {
     // A restarted process has no conversation to fork until its first turn; the window waits for one instead of ending.
@@ -265,21 +286,22 @@ async function ping($: EngineInterface, s: State) {
       s.waitForTurn = true
       return arm($, s)
     }
+    const reason = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
+      : reply.reason === 'aborted' ? 'the ping was interrupted'
+      : 'the ping returned no text'
     // A busy or failing API is usually brief; retry while a ping can still land a minute before the cache goes cold.
     if (reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)) {
       const at = await $.clock.now()
       const wait = MIN_PING_MS * 2 ** s.retries
       if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
         s.retries++
+        s.retryReason = reason
         s.pending = $.clock.after(wait, () => { void ping($, s) })
         updateStatus($, s, at)
         return
       }
     }
-    const reason = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
-      : reply.reason === 'aborted' ? 'the ping was interrupted'
-      : 'the ping returned no text'
-    return stop($, s, reason + (s.retries ? ` after ${s.retries} ${s.retries === 1 ? 'retry' : 'retries'}` : ''))
+    return stop($, s, reason + afterRetries(s.retries))
   }
   const u = reply.usage
   const price = priceOf(s.lastModel, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
@@ -290,6 +312,10 @@ async function ping($: EngineInterface, s: State) {
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
   await arm($, s)
+}
+
+function afterRetries(n: number): string {
+  return n ? ` after ${n} ${n === 1 ? 'retry' : 'retries'}` : ''
 }
 
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
@@ -333,7 +359,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0,
   }
 }
 
@@ -498,10 +524,10 @@ export const register: Register = on => {
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
-    // Only a person can send a dropped prompt again; a task notification, a schedule or a peer's message would be lost.
-    const typed = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
-    if (s.guard === 'warn' || !typed) {
-      $.ui.log(`${guardText(s, now)} Sending anyway${typed ? '' : `, since this ${e.origin.kind} prompt cannot be sent again`}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+    // A refused prompt that no person sent would be lost: nobody is there to send it again.
+    const unattended = UNATTENDED.has(e.origin.kind)
+    if (s.guard === 'warn' || unattended) {
+      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -542,7 +568,8 @@ export const register: Register = on => {
       s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + write
       const full = prev > 20000 && write >= 0.5 * prev
       if (full || s.coldWritePending) {
-        const price = priceOf(s.lastModel, s.ctx)
+        // The comeback write was paid by the turn's first request, whose prompt was the context before it.
+        const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
         if (s.deadline < now + AUTO_WARM_MS) {
