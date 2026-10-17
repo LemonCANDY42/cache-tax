@@ -34,7 +34,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -54,7 +54,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: opts.sid ?? 'S1' }))
+  on('session.id', () => ({ value: typeof opts.sid === 'function' ? opts.sid() : opts.sid ?? 'S1' }))
   on('session.model', () => ({ value: opts.model ?? 'claude-fable-5-1' }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: opts.live?.tokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -131,7 +131,7 @@ describe('cache indicator', () => {
       const theme = { value: 'dark' }
       const w = world(on, [], { theme })
       await $.session.start({ ...session, surface, isInteractive: true })
-      await $.command.run(run('keepwarm', '3h every 90m'))
+      await $.command.run(run('keepwarm', '3h'))
       const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
       const type = surface === 'terminal' ? 'Image' : 'Svg'
       const source = (variant: typeof statusIcons.dark) => surface === 'terminal' ? { png: variant.neutral.png } : variant.neutral.svg
@@ -143,8 +143,11 @@ describe('cache indicator', () => {
       }
       await $.turn.complete(turn())
       expect((await ui.find({ type }))?.props.source).toEqual(surface === 'terminal' ? { png: statusIcons.dark.warm.png } : statusIcons.dark.warm.svg)
+      // Off before the break and on again after it: the band shows cold without any ping being due.
+      await $.command.run(run('keepwarm', 'off'))
       await $.config.set(themeChange('light'))
       await clock.advance(HOUR)
+      await $.command.run(run('keepwarm', '3h'))
       expect((await ui.find({ type }))?.props.source).toEqual(surface === 'terminal' ? { png: statusIcons.light.cold.png } : statusIcons.light.cold.svg)
       expect((await ui.find({ type: 'Text', text: /^cold$/ }))?.props.color).toBe('#c15f3c')
       expect(w.forks.length).toBe(0)
@@ -173,13 +176,15 @@ describe('cache indicator', () => {
       await $.session.start({ ...session, surface, isInteractive: true })
       const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
       expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
-      await $.command.run(run('keepwarm', '3h every 90m'))
+      await $.command.run(run('keepwarm', '3h'))
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe(undefined)
       expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/unknown.*waiting for the first turn/)
       await $.turn.complete(turn())
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('success')
-      expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/warm.*ping in 1h30m/)
+      expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/warm.*ping in 50m/)
+      await $.command.run(run('keepwarm', 'off'))
       await clock.advance(HOUR)
+      await $.command.run(run('keepwarm', '3h'))
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('#d97757')
       expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold.*cold now/)
       expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/state       COLD/)
@@ -232,15 +237,15 @@ describe('cache indicator', () => {
 
   test('a warm resume restores green and ignores subagent cache activity', async ($, on) => {
     const clock = mock.clock(on, { now: 10 * HOUR })
-    const w = world(on, [], { store: new Map<string, unknown>([['deadline:S1', 13 * HOUR], ['every:S1', 90 * MIN]]) })
+    const w = world(on, [], { store: new Map<string, unknown>([['deadline:S1', 13 * HOUR]]) })
     await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
     await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 30 * 60, context_tokens: 200000 })
     const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
     expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('success')
     await $.turn.complete(turn({ agentId: 'worker' }))
     await $.session.compact({ trigger: 'manual', agentId: 'worker', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
-    await clock.advance(30 * MIN)
-    expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('#d97757')
+    await clock.advance(10 * MIN)
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/state       warm, 20m left/)
     expect(w.forks.length).toBe(0)
   })
 
@@ -864,5 +869,78 @@ describe('prices', () => {
     await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5' }) }))
     const card = await $.command.run(run('cache-tax', ''))
     expect(card.text).toMatch('cold cost   $0.02 to re-write it (warm turn $0.00)')
+  })
+})
+
+describe('keepwarm input', () => {
+  for (const args of ['3h every 60m', '3h every 90m', '3h every 2h']) {
+    test(`${args} is refused, since it would only fire on a cold cache`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [])
+      await $.session.start(session)
+      const r = await $.command.run(run('keepwarm', args))
+      expect(r.text).toBe('every takes a period from 1m to 59m')
+      expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    })
+  }
+
+  test('every 59m pings before the cache goes cold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h every 59m'))
+    await clock.advance(59 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  for (const args of ['0m', '0h', '0h0m']) {
+    test(`a ${args} window is refused`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [])
+      await $.session.start(session)
+      const r = await $.command.run(run('keepwarm', args))
+      expect(r.text).toBe('keepwarm takes a window such as 6h or 90m, or always, off, or status')
+    })
+  }
+
+  test('a stored period of an hour or more falls back to 50m', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm], { store: new Map<string, unknown>([['deadline:S1', START + 3 * HOUR], ['every:S1', 90 * MIN]]) })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+})
+
+describe('always after /clear', () => {
+  test('arms a fresh window under the new session id', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let sid = 'S1'
+    const w = world(on, [warm], { store, sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.get('deadline:S2')).toBe(START + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('without always, /clear leaves keepwarm off', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await $.classic.SessionStart({ source: 'clear' })
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(0)
   })
 })

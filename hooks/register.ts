@@ -370,7 +370,7 @@ export const register: Register = on => {
     const savedEvery = await $.store.get(everyKey(s))
     const savedGuard = await $.store.get(KEY_GUARD)
     s.deadline = typeof saved === 'number' && saved > now ? saved : 0
-    s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS ? savedEvery : PING_AFTER_MS
+    s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS && savedEvery < TTL_MS ? savedEvery : PING_AFTER_MS
     s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
     // Always means a fresh default window every session, whatever the last one left behind.
@@ -406,7 +406,9 @@ export const register: Register = on => {
       s.stopped = null
       resetForClear(s)
       s.sid = await $.session.id()
-      updateStatus($, s, await $.clock.now())
+      // No session.start fires after /clear, so this is where always arms the new conversation.
+      if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      else updateStatus($, s, await $.clock.now())
       return r
     }
     const line = seedFromResume(s, e, await $.clock.now())
@@ -439,12 +441,13 @@ export const register: Register = on => {
     }
     if (words[0] !== 'status') {
       const window = parseDuration(words[0])
-      if (window == null) return { text: 'keepwarm takes a window such as 6h or 90m, or always, off, or status' }
+      if (!window) return { text: 'keepwarm takes a window such as 6h or 90m, or always, off, or status' }
       // "every 2m" is a testing knob and lasts only for the window it was given with.
       let every = PING_AFTER_MS
       if (words[1] === 'every') {
         const period = parseDuration(words[2] ?? '')
-        if (period == null || period < MIN_PING_MS) return { text: 'every takes a period of at least 1m' }
+        // A period of the cache's whole hour or more would fire only once the cache is already cold.
+        if (period == null || period < MIN_PING_MS || period >= TTL_MS) return { text: 'every takes a period from 1m to 59m' }
         every = period
       }
       await startWindow($, s, window, every)

@@ -61,7 +61,7 @@ New to caching? [Anthropic explains how Claude Code uses it](https://code.claude
     /keepwarm               keep warm for six hours
     /keepwarm 90m           keep warm for a window of your own (also 2h30m, 6h)
     /keepwarm always        arm a six-hour window at every session start, remembered across sessions
-    /keepwarm 6h every 2m   pinging every two minutes; a testing knob, floor 1m, forgotten after this window
+    /keepwarm 6h every 2m   pinging every two minutes; a testing knob, 1m to 59m, forgotten after this window
     /keepwarm status        the warming window, next ping and last receipt
     /keepwarm off           stop, forget the window, and turn always off
     /cache-tax              the card
