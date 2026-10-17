@@ -1265,3 +1265,62 @@ describe('pings in flight', () => {
     expect(w.forks.length).toBe(2)
   })
 })
+
+describe('ping timing races', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a timer that fires while another ping waits on the clock never sends a second fork', async ($, on) => {
+    let now = START
+    let hold: Promise<void> | null = null
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      const h = hold
+      hold = null
+      if (h) await h
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    // Ping B's fork stays out until released, so it is in flight when A resumes.
+    let releaseFork = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { releaseFork = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A's clock read is held; the extension's own reads go through.
+    hold = new Promise<void>(r => { releaseClock = r })
+    timers.at(-1)?.()
+    await settle()
+    await $.command.run(run('keepwarm', '6h'))
+    now += 1000
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    releaseClock()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    releaseFork()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+  })
+
+  test('a superseded reply followed by an early timer still leaves the window armed', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    // A long tool call: the turn's first request lands, and the turn does not complete.
+    for await (const c of $.turn.step({ turnId: 'long', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
+    release()
+    await settle()
+    await clock.advance(2 * 1000)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+})

@@ -269,14 +269,15 @@ async function arm($: EngineInterface, s: State) {
 async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
-  // One fork at a time: the one already out re-arms when it settles.
-  if (s.inFlight) return
   const now = await $.clock.now()
+  // One fork at a time: the one already out re-arms when it settles. Checked after the await, and set
+  // below with no await in between, so two timers can never both send.
+  if (s.inFlight) return
   if (now >= s.deadline) return arm($, s)
-  // A turn in the meantime re-armed the timer; this callback is stale.
   if (isCold(s, now)) return arm($, s)
   if (s.compacted || s.waitForTurn || !s.lastRequestAt) return arm($, s)
-  if (now - s.lastRequestAt < s.every - 1000) return
+  // A request since this timer was set moved the clock; schedule from it.
+  if (now - s.lastRequestAt < s.every - 1000) return arm($, s)
   // A host that slept past a retry's slot must not send it inside the last minute.
   if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
   const gen = s.gen
