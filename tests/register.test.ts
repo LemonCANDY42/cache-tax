@@ -955,7 +955,7 @@ describe('guard by origin', () => {
       const r = await $.prompt.submit({ text: 'agent finished', wait: false, origin: { kind } })
       expect(r.drop).toBe(undefined)
       expect(w.entered).toEqual(['agent finished'])
-      expect(w.logs.at(-1)).toMatch(new RegExp(`Sending anyway, since a ${kind} prompt cannot be sent again`))
+      expect(w.logs.at(-1)).toMatch(new RegExp(`Sending anyway, since this ${kind} prompt cannot be sent again`))
       await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
       expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid/)
       await $.command.run(run('keepwarm', 'off'))

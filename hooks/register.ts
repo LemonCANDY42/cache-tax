@@ -501,7 +501,7 @@ export const register: Register = on => {
     // Only a person can send a dropped prompt again; a task notification, a schedule or a peer's message would be lost.
     const typed = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     if (s.guard === 'warn' || !typed) {
-      $.ui.log(`${guardText(s, now)} Sending anyway${typed ? '' : `, since a ${e.origin.kind} prompt cannot be sent again`}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+      $.ui.log(`${guardText(s, now)} Sending anyway${typed ? '' : `, since this ${e.origin.kind} prompt cannot be sent again`}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
