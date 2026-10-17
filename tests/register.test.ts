@@ -1348,3 +1348,59 @@ describe('retry after a window extension', () => {
     expect(w.status.at(-1)).toMatch(/last ping read 200k/)
   })
 })
+
+describe('one timer at a time', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a 429 that lands while /keepwarm is reading the clock leaves one live timer', async ($, on) => {
+    let now = START
+    let holdNext = false
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => { releaseClock = r })
+      }
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    // The extension writes its deadline, then arms; holding the next clock read pauses it inside arm().
+    let watch = false
+    class Store extends Map<string, unknown> {
+      override set(key: string, value: unknown) {
+        if (watch && key === 'deadline:S1') holdNext = true
+        return super.set(key, value)
+      }
+    }
+    let releaseFork = () => {}
+    const w = world(on, [busy, busy, busy, warm], { store: new Store(), gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { releaseFork = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    const before = timers.length
+    watch = true
+    const extension = $.command.run(run('keepwarm', '6h'))
+    await settle()
+    releaseFork()
+    await settle()
+    releaseClock()
+    await extension
+    await settle()
+    // Two timers were set since the first ping: the retry's, then the extension's. Fire the extension's at
+    // one second and the retry's at its minute, a beat apart, as the host would; only a live timer may send.
+    expect(timers.length - before).toBe(2)
+    now += 1000
+    timers[before + 1]?.()
+    await settle()
+    expect(w.forks.length).toBe(2)
+    now += MIN
+    timers[before]?.()
+    await settle()
+    expect(w.forks.length).toBe(2)
+  })
+})

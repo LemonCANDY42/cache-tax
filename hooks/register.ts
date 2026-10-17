@@ -250,6 +250,10 @@ async function arm($: EngineInterface, s: State) {
   s.retries = 0
   if (!s.deadline) return
   const now = await $.clock.now()
+  // A timer set while the clock was read, such as a retry, is replaced here, never left running beside this one;
+  // from this line to the assignment below nothing awaits.
+  disarm(s)
+  s.retries = 0
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
   if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
