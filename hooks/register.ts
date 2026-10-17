@@ -72,6 +72,7 @@ export type State = {
   retries: number
   retryReason: string
   gen: number
+  stepWrites: { usd: number; priced: boolean } | null
 }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
@@ -160,6 +161,8 @@ export function resetForClear(s: State) {
   s.coldWritePending = false
   s.misses = []
   s.waitForTurn = false
+  s.stepWrites = null
+  outdate(s)
   disarm(s)
 }
 
@@ -193,10 +196,13 @@ function updateStatus($: EngineInterface, s: State, now: number) {
   else $.ui.status(statusText(s, now))
 }
 
-/** Cancels the timer and outdates any ping in flight, whose reply must not touch the state that replaced it. */
 function disarm(s: State) {
   if (s.pending) s.pending.cancel()
   s.pending = null
+}
+
+/** Outdates any ping in flight: a turn, /clear, compaction or stop replaced the state it was sent for. Re-arming or extending the window does not, so a ping out at that moment still counts. */
+function outdate(s: State) {
   s.gen++
 }
 
@@ -227,6 +233,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   s.every = PING_AFTER_MS
   s.stopped = why
   s.retries = 0
+  outdate(s)
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
@@ -270,15 +277,12 @@ async function ping($: EngineInterface, s: State) {
   // A host that slept past a retry's slot must not send it inside the last minute.
   if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
   const gen = s.gen
-  let reply
-  try {
-    reply = await $.model.fork({ prompt: PING_PROMPT })
-  } catch (err) {
-    if (gen !== s.gen) return
-    return stop($, s, `the ping failed, ${err instanceof Error ? err.message : String(err)}`)
-  }
-  // A turn, /clear, compaction or stop while the fork was out has replaced the state it was sent for.
+  const sent = await $.model.fork({ prompt: PING_PROMPT }).then(reply => ({ reply }), (err: unknown) => ({ err }))
+  const at = await $.clock.now()
+  // Checked after the last await: a turn, /clear, compaction or stop while the fork was out has replaced its state.
   if (gen !== s.gen) return
+  if ('err' in sent) return stop($, s, `the ping failed, ${sent.err instanceof Error ? sent.err.message : String(sent.err)}`)
+  const reply = sent.reply
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
   if (reply.isAnswered === false) {
     // A restarted process has no conversation to fork until its first turn; the window waits for one instead of ending.
@@ -291,7 +295,6 @@ async function ping($: EngineInterface, s: State) {
       : 'the ping returned no text'
     // A busy or failing API is usually brief; retry while a ping can still land a minute before the cache goes cold.
     if (reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)) {
-      const at = await $.clock.now()
       const wait = MIN_PING_MS * 2 ** s.retries
       if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
         s.retries++
@@ -359,7 +362,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, stepWrites: null,
   }
 }
 
@@ -451,6 +454,8 @@ export const register: Register = on => {
   // Resume fields seed the guard before any turn of the resumed session has run.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
+    // A resumed or cleared conversation is not the one a ping in flight was sent for.
+    outdate(s)
     if (e.source === 'clear') {
       await stop($, s, null)
       s.stopped = null
@@ -542,12 +547,21 @@ export const register: Register = on => {
 
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) s.lastRequestAt = await $.clock.now()
-    yield* next(e)
+    const r = yield* next(e)
+    // Each request's write is priced at its own prompt length's tier (Haiku 5.5 changes price at 100k), not the turn's sum.
+    const u = r.usage
+    if (!e.agentId && u) {
+      const price = priceOf(u.model || e.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
+      const was = s.stepWrites ?? { usd: 0, priced: true }
+      s.stepWrites = { usd: was.usd + (price ? u.cache_creation_input_tokens * price[1] / 1e6 : 0), priced: was.priced && price != null }
+    }
+    return r
   })
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId) return r
+    outdate(s)
     const now = await $.clock.now()
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
@@ -568,9 +582,9 @@ export const register: Register = on => {
       s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + write
       const full = prev > 20000 && write >= 0.5 * prev
       if (full || s.coldWritePending) {
-        // The comeback write was paid by the turn's first request, whose prompt was the context before it.
+        // Priced per request when the steps reported usage; otherwise at the tier of the context the comeback re-sent.
         const price = priceOf(s.lastModel, prev || s.ctx)
-        const usd = price ? write * price[1] / 1e6 : null
+        const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
         if (s.deadline < now + AUTO_WARM_MS) {
           await startWindow($, s, AUTO_WARM_MS, s.every)
@@ -579,6 +593,7 @@ export const register: Register = on => {
       }
     }
     s.coldWritePending = false
+    s.stepWrites = null
     await arm($, s)
     return r
   })
@@ -589,6 +604,7 @@ export const register: Register = on => {
       s.compacted = true
       s.ctx = 0
       s.ackedAt = 0
+      outdate(s)
       disarm(s)
       await arm($, s)
     }

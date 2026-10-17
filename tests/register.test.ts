@@ -1,4 +1,5 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
@@ -34,7 +35,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void> } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[] } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -60,6 +61,11 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('command.list', () => ({ value: (opts.commands ?? []).map(name => ({ name, description: '', source: 'plugin' as const })) }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('turn.step', async function* ($, e) {
+    const u = opts.steps?.shift() ?? null
+    yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: u }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: u }
+  })
   on('prompt.submit', ($, e) => { entered.push(e.text); return { text: e.text } })
   on('session.compact', ($, e) => ({ messages: e.messages }))
   on('classic.SessionStart', () => ({}))
@@ -1132,7 +1138,7 @@ describe('price edge cases', () => {
     expect((await $.command.run(run('cache-tax', ''))).text).toMatch('cold cost   $0.32 to re-write it (warm turn $0.02)')
   })
 
-  test('a Haiku 5.5 comeback is priced at the tier of the prompt that paid it, not the turn\'s last request', async ($, on) => {
+  test('without step usage, a Haiku 5.5 comeback is priced at the tier of the context it re-sent', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     world(on, [])
     await $.session.start(session)
@@ -1142,5 +1148,56 @@ describe('price edge cases', () => {
     // Two requests summed: the 99k comeback write under 100k, then a step that crossed it.
     await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5', cache_read_input_tokens: 0, cache_creation_input_tokens: 100500 }) }))
     expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.02/)
+  })
+})
+
+describe('per-request pricing and window extension', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+  const haiku = (read: number, write: number) => usage({ model: 'claude-haiku-5-5', cache_read_input_tokens: read, cache_creation_input_tokens: write })
+  const step = async ($: Parameters<TestBody>[0], index: number) => {
+    for await (const c of $.turn.step({ turnId: 'comeback', index, model: 'claude-haiku-5-5', messageCount: 2 })) void c
+  }
+
+  test('a Haiku 5.5 comeback request over 100k is priced at the long tier though the context before was under it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { steps: [haiku(0, 101000)] })
+    await $.session.start(session)
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await $.turn.complete(turn({ usage: haiku(0, 99000) }))
+    await clock.advance(2 * HOUR)
+    await step($, 0)
+    await $.turn.complete(turn({ usage: haiku(0, 101000) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.10/)
+  })
+
+  test('a Haiku 5.5 turn whose requests straddle 100k prices each write at its own tier', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { steps: [haiku(0, 99000), haiku(99000, 60000)] })
+    await $.session.start(session)
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await $.turn.complete(turn({ usage: haiku(0, 99000) }))
+    await clock.advance(2 * HOUR)
+    await step($, 0)
+    await step($, 1)
+    // 99,000 at $0.20 plus 60,000 at $1, against $0.16 for all at $1 or $0.03 for all at $0.20.
+    await $.turn.complete(turn({ usage: haiku(99000, 159000) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.08/)
+  })
+
+  test('a ping out when /keepwarm extends the window still counts', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await $.command.run(run('keepwarm', '6h'))
+    release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
   })
 })
