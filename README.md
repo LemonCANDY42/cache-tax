@@ -144,7 +144,7 @@ claude plugin validate .claude-plugin/plugin.json
 claude plugin test .
 ```
 
-The [94 tests](tests/register.test.ts) use a mock clock and engine. They cover:
+The [106 tests](tests/register.test.ts) use a mock clock and engine. They cover:
 
 - **Guard:** refuse once and resend, warn mode, slash commands, small contexts, prompts nobody typed, resume seeding and cold-write scoring.
 - **Warming:** command defaults and refused windows and periods, always/off, always after `/clear`, idle resets, usage-based stopping, cold-window expiry and delayed timers after sleep.
@@ -152,7 +152,7 @@ The [94 tests](tests/register.test.ts) use a mock clock and engine. They cover:
 - **Pricing and display:** a row for every listed model, the Haiku 5.5 long-prompt tier, Opus 4 and 4.1 apart from Opus 4.5, output and uncached input costs, context counts, duration formatting and the read-only break-even figure.
 - **Indicator:** terminal images and desktop SVGs, theme selection, warm/cold transitions, resume, compaction, clear, expiry, surveys, other mods' content, text alternatives and `NO_COLOR` fallback.
 - **Preferences:** one read per session, immediate theme updates, denied changes and the effective theme returned by the settings writer.
-- **Fork failures:** a busy API is retried while the cache is warm, nothing to fork waits for the next turn, and other failures and the null result returned by older releases stop without retrying.
+- **Fork failures:** a busy API is retried while the cache is warm, a retry that wakes too late is dropped, nothing to fork waits for the next turn, a reply that lands after a turn, `/clear` or compaction is discarded, and other failures and the null result returned by older releases stop without retrying.
 
 The render tests check the element tree, not native terminal or desktop pixels. They do not validate server-side cache retention. See [the live check](#prove-it-on-your-own-session).
 
