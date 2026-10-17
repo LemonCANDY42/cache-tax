@@ -826,3 +826,43 @@ describe('store per session', () => {
     expect([...store.keys()]).toEqual(['deadline:other', 'every:other'])
   })
 })
+
+describe('prices', () => {
+  for (const [model, cold, warmTurn, pings] of [
+    ['claude-opus-5-5', '1.60', '0.04', 40],
+    ['claude-opus-5', '2.00', '0.10', 20],
+    ['claude-sonnet-5-5', '0.80', '0.02', 40],
+    ['claude-haiku-5-5', '0.20', '0.01', 20],
+    ['claude-mythos-5-1', '4.00', '0.05', 80],
+    ['claude-opus-4-1-20250805', '6.00', '0.30', 20],
+    ['claude-opus-4-20250514', '6.00', '0.30', 20],
+    ['claude-opus-4@20250514', '6.00', '0.30', 20],
+    ['claude-opus-4-1@20250805', '6.00', '0.30', 20],
+    ['anthropic.claude-opus-4-1-20250805-v1:0', '6.00', '0.30', 20],
+    ['claude-opus-4-1', '6.00', '0.30', 20],
+    ['claude-opus-4-5-20251101', '2.00', '0.10', 20],
+    ['claude-opus-4-5@20251101', '2.00', '0.10', 20],
+    ['anthropic.claude-opus-4-5-20251101-v1:0', '2.00', '0.10', 20],
+    ['claude-opus-4-8', '2.00', '0.10', 20],
+    ['claude-3-5-haiku-20241022', '0.32', '0.02', 20],
+  ] as const) {
+    test(`${model} at 200k tokens is priced from its own row`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [], { live: { tokens: 200000 } })
+      await $.session.start(session)
+      await $.turn.complete(turn({ usage: usage({ model }) }))
+      const card = await $.command.run(run('cache-tax', ''))
+      expect(card.text).toMatch(`cold cost   $${cold} to re-write it (warm turn $${warmTurn})`)
+      expect(card.text).toMatch(`break-even  up to ${pings} pings`)
+    })
+  }
+
+  test('Haiku 5.5 up to 100k tokens takes the short-prompt row', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [], { live: { tokens: 100000 } })
+    await $.session.start(session)
+    await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5' }) }))
+    const card = await $.command.run(run('cache-tax', ''))
+    expect(card.text).toMatch('cold cost   $0.02 to re-write it (warm turn $0.00)')
+  })
+})

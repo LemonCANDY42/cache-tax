@@ -13,16 +13,31 @@ const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
 
-// $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
-// Longer family names first: a model id matches the first row it contains.
-const PRICES: Array<[string, number, number, number]> = [
+const LONG_PROMPT_TOKENS = 100000
+
+// $ per million tokens, [cache read, 1h cache write, output], list prices October 2026.
+// More specific families first: a model id takes the first row it matches.
+const PRICES: Array<[string | RegExp, number, number, number]> = [
   ['fable-5-1', 0.25, 20, 50],
+  ['mythos-5-1', 0.25, 20, 50],
   ['fable-5', 1, 20, 50],
+  ['mythos-5', 1, 20, 50],
+  ['opus-5-5', 0.2, 8, 20],
   ['opus-5', 0.5, 10, 25],
+  // Opus 4 and 4.1 in every spelling (claude-opus-4-1-20250805, claude-opus-4@20250514, the -0 and -1 aliases), never Opus 4.5 and later.
+  [/opus-4(?:-[01])?(?:$|[^-\d]|-20\d{6})/, 1.5, 30, 75],
   ['opus-4', 0.5, 10, 25],
+  ['sonnet-5-5', 0.1, 4, 10],
   ['sonnet-5', 0.2, 4, 10],
   ['sonnet', 0.3, 6, 15],
+  ['haiku-5-5', 0.01, 0.2, 0.5],
+  ['3-5-haiku', 0.08, 1.6, 4],
   ['haiku', 0.1, 2, 5],
+]
+
+// A request whose prompt, cache reads and writes included, is over 100k tokens pays these instead.
+const LONG_PRICES: Array<[string, number, number, number]> = [
+  ['haiku-5-5', 0.05, 1, 2.5],
 ]
 
 type PingRecord = { at: number; read: number; write: number; usd: number | null; warm: boolean }
@@ -48,9 +63,14 @@ export type State = {
   stopped: string | null
 }
 
-function priceOf(model: string | null): [number, number, number] | null {
+function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
-  for (const [family, read, write, output] of PRICES) if (m.includes(family)) return [read, write, output]
+  if (promptTokens > LONG_PROMPT_TOKENS) {
+    for (const [family, read, write, output] of LONG_PRICES) if (m.includes(family)) return [read, write, output]
+  }
+  for (const [family, read, write, output] of PRICES) {
+    if (typeof family === 'string' ? m.includes(family) : family.test(m)) return [read, write, output]
+  }
   return null
 }
 
@@ -77,12 +97,12 @@ function fmtTok(n: number): string {
 }
 
 function coldUsd(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   return price ? s.ctx * price[1] / 1e6 : null
 }
 
 function warmUsd(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   return price ? s.ctx * price[0] / 1e6 : null
 }
 
@@ -93,7 +113,7 @@ function pingUsd(u: { input_tokens: number; output_tokens: number; cache_read_in
 
 /** The read-only upper bound: pings at the cache-read rate that cost as much as one cold write of the same context. */
 function breakEvenPings(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   if (!price || s.ctx <= 0) return null
   return Math.floor(price[1] / price[0])
 }
@@ -103,7 +123,7 @@ function isCold(s: State, now: number): boolean {
 }
 
 function guardText(s: State, now: number): string {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   const rate = price ? `$${price[1]}/MTok` : 'the cache-write rate'
   const warm = warmUsd(s)
   return `the prompt cache went cold ${fmtDuration(now - s.lastRequestAt - TTL_MS)} ago. Sending this re-writes ` +
@@ -239,7 +259,7 @@ async function ping($: EngineInterface, s: State) {
     return stop($, s, reason)
   }
   const u = reply.usage
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
   // A warm ping reads the prefix and writes only its own message; a write of a tenth of the read or more means the prefix broke.
   const warm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
   const usd = price ? pingUsd(u, price) : null
@@ -492,7 +512,7 @@ export const register: Register = on => {
       s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + write
       const full = prev > 20000 && write >= 0.5 * prev
       if (full || s.coldWritePending) {
-        const price = priceOf(s.lastModel)
+        const price = priceOf(s.lastModel, s.ctx)
         const usd = price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
         if (s.deadline < now + AUTO_WARM_MS) {
