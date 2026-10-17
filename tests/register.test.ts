@@ -1324,3 +1324,27 @@ describe('ping timing races', () => {
     expect(w.forks.length).toBe(2)
   })
 })
+
+describe('retry after a window extension', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a 429 that lands after /keepwarm extends the window waits the full retry delay', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [busy, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+    // The extension's one-second timer is gone; only the one-minute retry remains.
+    await clock.advance(30 * 1000)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(30 * 1000)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+  })
+})

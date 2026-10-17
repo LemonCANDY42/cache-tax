@@ -307,6 +307,8 @@ async function ping($: EngineInterface, s: State) {
       if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
         s.retries++
         s.retryReason = reason
+        // Replaces any timer set while the fork was out, such as a window extension's, so only the retry fires.
+        disarm(s)
         s.pending = $.clock.after(wait, () => { void ping($, s) })
         updateStatus($, s, at)
         return
