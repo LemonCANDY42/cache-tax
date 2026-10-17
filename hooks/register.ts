@@ -72,6 +72,7 @@ export type State = {
   retries: number
   retryReason: string
   gen: number
+  inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
 }
 
@@ -201,7 +202,7 @@ function disarm(s: State) {
   s.pending = null
 }
 
-/** Outdates any ping in flight: a turn, /clear, compaction or stop replaced the state it was sent for. Re-arming or extending the window does not, so a ping out at that moment still counts. */
+/** Outdates any ping in flight: /clear, a resume, compaction or stop replaced the state it was sent for. Re-arming or extending the window does not, so a ping out at that moment still counts; a main request outdates it through the request clock. */
 function outdate(s: State) {
   s.gen++
 }
@@ -268,6 +269,8 @@ async function arm($: EngineInterface, s: State) {
 async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
+  // One fork at a time: the one already out re-arms when it settles.
+  if (s.inFlight) return
   const now = await $.clock.now()
   if (now >= s.deadline) return arm($, s)
   // A turn in the meantime re-armed the timer; this callback is stale.
@@ -277,10 +280,14 @@ async function ping($: EngineInterface, s: State) {
   // A host that slept past a retry's slot must not send it inside the last minute.
   if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
   const gen = s.gen
+  const sentAt = s.lastRequestAt
+  s.inFlight = true
   const sent = await $.model.fork({ prompt: PING_PROMPT }).then(reply => ({ reply }), (err: unknown) => ({ err }))
   const at = await $.clock.now()
-  // Checked after the last await: a turn, /clear, compaction or stop while the fork was out has replaced its state.
-  if (gen !== s.gen) return
+  s.inFlight = false
+  // Checked after the last await. A stop, /clear, resume or compaction, or a main request that moved the
+  // cache clock, replaced what this fork was sent for: its reply is dropped and the window armed afresh.
+  if (gen !== s.gen || s.lastRequestAt !== sentAt) return s.pending ? undefined : arm($, s)
   if ('err' in sent) return stop($, s, `the ping failed, ${sent.err instanceof Error ? sent.err.message : String(sent.err)}`)
   const reply = sent.reply
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
@@ -362,7 +369,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, inFlight: false, stepWrites: null,
   }
 }
 
@@ -561,12 +568,12 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId) return r
-    outdate(s)
     const now = await $.clock.now()
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
-    if (now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
+    // A turn aborted before it sent anything touched no cache, so it leaves the clock alone.
+    if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
     s.waitForTurn = false
     s.ackedAt = 0

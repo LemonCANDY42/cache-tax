@@ -1201,3 +1201,67 @@ describe('per-request pricing and window extension', () => {
     expect(w.forks.length).toBe(2)
   })
 })
+
+describe('pings in flight', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+  // Holds the first fork until released; later forks answer at once.
+  const holdFirst = (w: () => { forks: number[] }) => {
+    let release = () => {}
+    const gate = async () => { if (w().forks.length === 1) await new Promise<void>(r => { release = r }) }
+    return { gate, release: () => release() }
+  }
+
+  test('extending the window while a ping is out sends no second ping, and a cold reply then stops it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    await clock.advance(5 * 1000)
+    expect(w.forks.length).toBe(1)
+    h.release()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/keepwarm stopped: the ping read 0 and wrote 200k/)
+  })
+
+  test('a main request while a ping is out supersedes its cold reply', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await clock.advance(MIN)
+    for await (const c of $.turn.step({ turnId: 'next', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
+    h.release()
+    await settle()
+    expect(w.status.at(-1)).not.toMatch(/stopped/)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  test('a turn aborted before any request keeps the reply of a ping that was out', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [warm, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await clock.advance(MIN)
+    await $.turn.complete(turn({ isAborted: true, usage: undefined }))
+    h.release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+    // The next ping counts from the ping's own read, not from the aborted turn.
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+})
