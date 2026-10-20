@@ -61,6 +61,8 @@ export type State = {
   lastModel: string | null
   ctx: number
   compacted: boolean
+  coldUnknown: boolean
+  transcript: number
   guard: GuardMode
   ackedAt: number
   coldWritePending: boolean
@@ -161,6 +163,8 @@ export function resetForClear(s: State) {
   s.ctx = 0
   s.lastRequestAt = 0
   s.compacted = false
+  s.coldUnknown = false
+  s.transcript = 0
   s.ackedAt = 0
   s.coldWritePending = false
   s.misses = []
@@ -174,12 +178,32 @@ export function resetForClear(s: State) {
 export function seedFromResume(s: State, e: ResumeFields, now: number): string | null {
   if (e.source !== 'resume' && e.source !== 'fork') return null
   if (typeof e.context_tokens === 'number' && e.context_tokens > 0) s.ctx = e.context_tokens
-  if (typeof e.seconds_since_last_response === 'number') s.lastRequestAt = now - e.seconds_since_last_response * 1000
+  if (typeof e.seconds_since_last_response === 'number') {
+    s.lastRequestAt = now - e.seconds_since_last_response * 1000
+    s.coldUnknown = false
+  }
   if (typeof e.model === 'string') s.lastModel = e.model
   s.compacted = false
   if (e.prompt_cache_likely_expired !== true || s.ctx < BIG_TOKENS) return null
   const usd = typeof e.estimated_cache_write_usd === 'number' ? fmtUsd(e.estimated_cache_write_usd) : fmtUsd(coldUsd(s))
   return `resuming cold. The first message re-writes ${s.ctx.toLocaleString('en-US')} tokens, about ${usd}. /clear and paste a summary if you only need the conclusions.`
+}
+
+/** The line for a resumed session whose last response time never arrived: the cache may be cold, and this is what that would cost. */
+function unknownText(s: State): string {
+  const price = priceOf(s.lastModel, s.ctx)
+  const rate = price ? `$${price[1]}/MTok` : 'the cache-write rate'
+  return `resumed with up to ${s.ctx.toLocaleString('en-US')} tokens of context and no time of its last response, so the cache may be cold. ` +
+    `If it is, this message re-writes them at ${rate} = ${fmtUsd(coldUsd(s))}.`
+}
+
+/** The conversation was summarized: nothing priced before it still exists, and the next turn is the first over the new prefix. */
+function markCompacted(s: State) {
+  s.compacted = true
+  s.ctx = 0
+  s.transcript = 0
+  s.ackedAt = 0
+  outdate(s)
 }
 
 function statusText(s: State, now: number): string | undefined {
@@ -250,6 +274,40 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   await $.store.delete(everyKey(s))
   if (forgetAlways) await $.store.delete(KEY_ALWAYS)
   updateStatus($, s, await $.clock.now())
+}
+
+/** The conversation ended under /clear or an in-process resume. The next one's id cannot be read until the engine has switched, so the state is left unseated. */
+async function endConversation($: EngineInterface, s: State, reason: 'clear' | 'resume') {
+  outdate(s)
+  // /clear ends the conversation the window was armed for; a resume carries the window on to the next one.
+  if (reason === 'clear') {
+    await stop($, s, null)
+    s.stopped = null
+  }
+  resetForClear(s)
+  s.sid = ''
+}
+
+/** Reads the session the process runs now: its id, and the engine's figures for its context. Returns the time read with them. */
+async function seat($: EngineInterface, s: State): Promise<number> {
+  s.sid = await $.session.id()
+  const usage = await $.session.usage()
+  const now = await $.clock.now()
+  if (usage.context.tokens) s.ctx = usage.context.tokens
+  // A transcript first launched over an hour ago may have gone cold, and only the resume fields say when its last response was.
+  s.coldUnknown = !s.lastRequestAt && now - usage.startedAt >= TTL_MS
+  // Pricing a cold send needs the model, which no turn of a resumed transcript has reported yet.
+  if (s.coldUnknown && !s.lastModel) s.lastModel = await $.session.model()
+  return now
+}
+
+/** Seats the state in the conversation that followed a /clear or a resume, once, and arms what always or a window opened meanwhile asks for. */
+async function reseat($: EngineInterface, s: State) {
+  if (s.sid) return
+  const now = await seat($, s)
+  if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+  else if (s.deadline) await arm($, s)
+  else updateStatus($, s, now)
 }
 
 async function arm($: EngineInterface, s: State) {
@@ -385,6 +443,7 @@ function card(s: State, now: number): string {
   const lines: string[] = []
   lines.push(`${s.lastModel ?? 'model not seen yet'}`)
   if (s.compacted) lines.push('state       reset by compaction, waiting for the first turn')
+  else if (s.coldUnknown) lines.push('state       unknown, resumed without the time of its last response')
   else if (!s.lastRequestAt) lines.push('state       no request yet this session')
   else if (isCold(s, now)) lines.push(`state       COLD, last request ${fmtDuration(now - s.lastRequestAt)} ago`)
   else lines.push(`state       warm, ${fmtDuration(s.lastRequestAt + TTL_MS - now)} left`)
@@ -404,7 +463,7 @@ function card(s: State, now: number): string {
 export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
-    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    coldUnknown: false, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
     waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null,
   }
 }
@@ -459,8 +518,7 @@ export const register: Register = on => {
       noColor = Boolean(await $.env.get('NO_COLOR'))
       $.ui.status(undefined)
     }
-    s.sid = await $.session.id()
-    const now = await $.clock.now()
+    const now = await seat($, s)
     await prune($, s, now)
     const saved = await $.store.get(deadlineKey(s))
     const savedEvery = await $.store.get(everyKey(s))
@@ -471,8 +529,8 @@ export const register: Register = on => {
     s.always = (await $.store.get(KEY_ALWAYS)) === true
     // Always means a fresh default window every session, whatever the last one left behind.
     if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
-    const usage = await $.session.usage()
-    if (usage.context.tokens) s.ctx = usage.context.tokens
+    // The classic start arms a restored window too, but a managed plugin above this tier may continue beneath it; arming twice leaves one timer.
+    else if (s.deadline) await arm($, s)
     await $.command.register({
       name: 'keepwarm',
       description: 'Keep the prompt cache warm: bare for 6h, a window such as 90m, always, off, or status (cache-tax)',
@@ -494,23 +552,27 @@ export const register: Register = on => {
     return r
   })
 
+  // On Team and Enterprise accounts a managed plugin seated above this tier handles classic.* and continues beneath it, so
+  // nothing here is relied on alone: session.end carries the /clear, turn.step the compaction, and the engine's own figures
+  // the resumed context. What arrives here refines that, once: a clear already ended is only seated, a seat is never redone.
+  on('session.end', async ($, e, next) => {
+    // Only the conversation this state sits in: after the classic start of the next one, the old id is history.
+    if ((e.reason === 'clear' || e.reason === 'resume') && e.sessionId === s.sid) await endConversation($, s, e.reason)
+    return next(e)
+  })
+
   // Resume fields seed the guard before any turn of the resumed session has run.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
     // A resumed or cleared conversation is not the one a ping in flight was sent for.
     outdate(s)
     if (e.source === 'clear') {
-      await stop($, s, null)
-      s.stopped = null
-      resetForClear(s)
-      s.sid = await $.session.id()
+      if (s.sid) await endConversation($, s, 'clear')
       // No session.start fires after /clear, so this is where always arms the new conversation.
-      if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
-      // A window armed while this handler awaited lost its timer to resetForClear; arm it again.
-      else if (s.deadline) await arm($, s)
-      else updateStatus($, s, await $.clock.now())
+      await reseat($, s)
       return r
     }
+    await reseat($, s)
     const line = seedFromResume(s, e, await $.clock.now())
     // The resume payload may omit the model; without it the guard cannot price the cold write.
     if (!s.lastModel) s.lastModel = await $.session.model()
@@ -521,6 +583,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'keepwarm' }, async ($, e) => {
+    await reseat($, s)
     const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
     const now = await $.clock.now()
     if (words[0] === 'off') {
@@ -558,6 +621,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'cache-tax' }, async ($, e) => {
+    await reseat($, s)
     const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
     const now = await $.clock.now()
     if (words[0] === 'guard') {
@@ -572,8 +636,15 @@ export const register: Register = on => {
   // The message that pays. Only its first character is read.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin') return next(e)
+    await reseat($, s)
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
+    // Without the time of the last response nothing says whether the cache is cold: the price is shown once and the message goes through.
+    if (s.coldUnknown) {
+      s.coldUnknown = false
+      if (s.ctx >= BIG_TOKENS) $.ui.log(unknownText(s))
+      return next(e)
+    }
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
     // A refused prompt that no person sent would be lost: nobody is there to send it again.
     const unattended = UNATTENDED.has(e.origin.kind)
@@ -593,8 +664,12 @@ export const register: Register = on => {
 
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) {
+      await reseat($, s)
       // The off count when the turn's first request went out: an off after it wins over what the turn opens.
       if (e.index === 0) s.turnOffs = s.offs
+      // A request over fewer messages than the last one: the conversation was compacted since, whether or not session.compact arrived.
+      if (e.messageCount < s.transcript) markCompacted(s)
+      s.transcript = e.messageCount
       s.lastRequestAt = await $.clock.now()
     }
     const r = yield* next(e)
@@ -622,6 +697,7 @@ export const register: Register = on => {
     // A turn aborted before it sent anything touched no cache, so it leaves the clock alone.
     if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
+    if (s.lastRequestAt) s.coldUnknown = false
     s.waitForTurn = false
     s.ackedAt = 0
     // Always covers any break up to six hours after a turn that reached the cache (a turn that failed before any
@@ -664,10 +740,7 @@ export const register: Register = on => {
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     if (!e.agentId) {
-      s.compacted = true
-      s.ctx = 0
-      s.ackedAt = 0
-      outdate(s)
+      markCompacted(s)
       disarm(s)
       await arm($, s)
     }
