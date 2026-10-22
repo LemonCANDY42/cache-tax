@@ -79,10 +79,11 @@ export type State = {
   turnOffs: number | null
   inFlight: boolean
   stepWrites: StepWrites | null
-  preCompactWrites: StepWrites | null
+  steps: number
+  endingSid: string
 }
 
-/** What this turn's main requests wrote so far, priced per request where the steps reported usage. */
+/** What this turn's main requests wrote before any compaction it saw, priced per request where the steps reported usage. */
 type StepWrites = { tokens: number; usd: number; priced: boolean }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
@@ -174,7 +175,7 @@ export function resetForClear(s: State) {
   s.misses = []
   s.waitForTurn = false
   s.stepWrites = null
-  s.preCompactWrites = null
+  s.steps = 0
   outdate(s)
   disarm(s)
 }
@@ -212,8 +213,6 @@ function markCompacted(s: State) {
   s.compacted = true
   s.transcript = 0
   s.ackedAt = 0
-  // What the turn wrote up to here is all it can be scored on; the summary written next is no cold write.
-  s.preCompactWrites = s.stepWrites
   outdate(s)
 }
 
@@ -292,8 +291,10 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   // Claimed before any await: a second end or a classic start for the same conversation finds it already gone, and an
   // end cut short by its budget leaves no timer and no old id behind, only the keys below.
   const keys = [deadlineKey(s), everyKey(s)]
+  const ending = s.sid
   resetForClear(s)
   s.sid = ''
+  s.endingSid = ending
   // /clear ends the conversation the window was armed for. A resume carries the window on to the next one, under its
   // id: the old id's keys go here, or a /keepwarm off there could never find them and the old session would re-arm them.
   if (reason === 'clear') {
@@ -307,8 +308,9 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
 }
 
 /** Reads the session the process runs now: its id, its model and the engine's figures for its context. Returns the time read with them. */
-async function seat($: EngineInterface, s: State): Promise<number> {
-  s.sid = await $.session.id()
+async function seat($: EngineInterface, s: State, id?: string): Promise<number> {
+  s.sid = id ?? await $.session.id()
+  s.endingSid = ''
   s.lastModel = await $.session.model()
   const usage = await $.session.usage()
   const now = await $.clock.now()
@@ -321,7 +323,11 @@ async function seat($: EngineInterface, s: State): Promise<number> {
 /** Seats the state in the conversation that followed a /clear or a resume, once, and arms what always or a window opened meanwhile asks for. */
 async function reseat($: EngineInterface, s: State) {
   if (s.sid) return
-  const now = await seat($, s)
+  const id = await $.session.id()
+  // The host still answers with the conversation being ended: the next one is not there to seat yet, so nothing is
+  // seated under the old id, and a window opened meanwhile waits in memory for the id it belongs to.
+  if (id === s.endingSid) return
+  const now = await seat($, s, id)
   if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
   // A window carried over, or armed while the conversation was ending, is written under this id.
   else if (s.deadline) await startWindow($, s, s.deadline - now, s.every)
@@ -443,6 +449,8 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   s.every = every
   s.deadline = deadline
   s.stopped = null
+  // Unseated, between a conversation's end and the host reporting the next, the window has no id to be written under; the seat writes it.
+  if (!s.sid) return arm($, s)
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
   await $.store.set(deadlineKey(s), deadline)
@@ -482,7 +490,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     resumedAt: 0, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, preCompactWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, steps: 0, endingSid: '',
   }
 }
 
@@ -688,12 +696,14 @@ export const register: Register = on => {
       // turn.complete still scores a cold write this turn paid against it before the live figure replaces it.
       if (e.messageCount * 2 < s.transcript) markCompacted(s)
       s.transcript = e.messageCount
+      // Only a request sent before any compaction this turn saw can hold a cold write; what follows one is the summary.
+      if (!s.compacted) s.steps++
       s.lastRequestAt = await $.clock.now()
     }
     const r = yield* next(e)
     // Each request's write is priced at its own prompt length's tier (Haiku 5.5 changes price at 100k), not the turn's sum.
     const u = r.usage
-    if (!e.agentId && u) {
+    if (!e.agentId && u && !s.compacted) {
       const price = priceOf(u.model || e.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
       const was = s.stepWrites ?? { tokens: 0, usd: 0, priced: true }
       s.stepWrites = { tokens: was.tokens + u.cache_creation_input_tokens, usd: was.usd + (price ? u.cache_creation_input_tokens * price[1] / 1e6 : 0), priced: was.priced && price != null }
@@ -739,12 +749,12 @@ export const register: Register = on => {
       const live = (await $.session.usage()).context.tokens
       s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + written
       // A compaction since the last complete turn: what followed it is the summary, no cold write, so the turn is scored
-      // on what the steps wrote before it. A host that reports no step usage leaves only the turn's total, an upper
-      // bound kept for a send the guard saw go cold and for nothing else.
-      const writes = compacted ? s.preCompactWrites : s.stepWrites
-      const write = !compacted ? written : writes ? writes.tokens : s.coldWritePending ? written : 0
+      // on the requests before it alone. None before it leaves nothing to score, whatever the guard saw; requests before
+      // it that reported no usage leave only the turn's total, an upper bound kept for a send the guard saw go cold.
+      const writes = s.stepWrites
+      const write = !compacted ? written : writes ? writes.tokens : s.steps && s.coldWritePending ? written : 0
       const full = prev > 20000 && write >= 0.5 * prev
-      if (full || s.coldWritePending) {
+      if (full || (s.coldWritePending && write > 0)) {
         // Priced per request when the steps reported usage; otherwise at the tier of the context the comeback re-sent.
         const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = writes?.priced ? writes.usd : price ? write * price[1] / 1e6 : null
@@ -757,7 +767,7 @@ export const register: Register = on => {
     }
     s.coldWritePending = false
     s.stepWrites = null
-    s.preCompactWrites = null
+    s.steps = 0
     await arm($, s)
     return r
   })

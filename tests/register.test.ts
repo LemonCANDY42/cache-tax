@@ -2221,4 +2221,66 @@ describe('a managed plugin above the user tier', () => {
     await ending
     expect(store.has('deadline:S1')).toBe(false)
   })
+
+  test('a /keepwarm while the old conversation is still ending waits for the host to report the next id', { plugins: [managed] }, async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    let sid = 'S1'
+    let model = 'claude-fable-5-1'
+    const held = holdDeletes('deadline:S1')
+    const w = world(on, [], { store, sid: () => sid, model: () => model, storeGate: held.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '1h'))
+    const ending = end($, 'S1')
+    await settle()
+    expect(held.held()).toBe(1)
+    // The host still answers the old id: the window waits in memory, nothing is written under that id.
+    expect((await $.command.run(run('keepwarm', '2h'))).text).toMatch(/^keepwarm on for 2h00m/)
+    expect(store.get('deadline:S1')).toBe(START + HOUR)
+    held.release()
+    await ending
+    expect(store.size).toBe(0)
+    sid = 'S2'
+    model = 'claude-haiku-5-5'
+    await $.prompt.submit(prompt('hi'))
+    expect([...store.keys()]).toEqual(['deadline:S2'])
+    expect(store.get('deadline:S2')).toBe(START + 2 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 2h00m left · waiting for the first turn')
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/^claude-haiku-5-5\n/)
+  })
+
+  test('a guarded cold send compacted before its first request pays the summary, not a cold write', { plugins: [managed] }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { steps: [usage(), usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 150000 })] })
+    await $.session.start(session)
+    await step($, 'first', 0, 40)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/^cache-tax:/)
+    await $.prompt.submit(prompt('hi'))
+    await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
+    await step($, 'comeback', 0, 3)
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 150000 }) }))
+    expect(w.logs).toEqual([])
+    expect(w.status.at(-1)).toBe(undefined)
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     0 cold writes paid/)
+  })
+
+  test('a second compaction in one turn does not turn the first summary into a cold write', { plugins: [managed] }, async ($, on) => {
+    mock.clock(on, { now: START })
+    const summary = usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 120000 })
+    const w = world(on, [], { steps: [usage(), usage(), summary, usage(), summary] })
+    await $.session.start(session)
+    await step($, 'first', 0, 40)
+    await $.turn.complete(turn())
+    await step($, 'long', 0, 42)
+    await step($, 'long', 1, 3)
+    await step($, 'long', 2, 15)
+    await step($, 'long', 3, 3)
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 200000, cache_creation_input_tokens: 241000 }) }))
+    expect(w.logs).toEqual([])
+    expect(w.status.at(-1)).toBe(undefined)
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     0 cold writes paid/)
+  })
 })
