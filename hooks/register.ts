@@ -78,8 +78,12 @@ export type State = {
   offs: number
   turnOffs: number | null
   inFlight: boolean
-  stepWrites: { usd: number; priced: boolean } | null
+  stepWrites: StepWrites | null
+  preCompactWrites: StepWrites | null
 }
+
+/** What this turn's main requests wrote so far, priced per request where the steps reported usage. */
+type StepWrites = { tokens: number; usd: number; priced: boolean }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
@@ -170,6 +174,7 @@ export function resetForClear(s: State) {
   s.misses = []
   s.waitForTurn = false
   s.stepWrites = null
+  s.preCompactWrites = null
   outdate(s)
   disarm(s)
 }
@@ -207,6 +212,8 @@ function markCompacted(s: State) {
   s.compacted = true
   s.transcript = 0
   s.ackedAt = 0
+  // What the turn wrote up to here is all it can be scored on; the summary written next is no cold write.
+  s.preCompactWrites = s.stepWrites
   outdate(s)
 }
 
@@ -282,18 +289,21 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
 
 /** The conversation ended under /clear or an in-process resume. The next one's id cannot be read until the engine has switched, so the state is left unseated. */
 async function endConversation($: EngineInterface, s: State, reason: 'clear' | 'resume') {
-  outdate(s)
+  // Claimed before any await: a second end or a classic start for the same conversation finds it already gone, and an
+  // end cut short by its budget leaves no timer and no old id behind, only the keys below.
+  const keys = [deadlineKey(s), everyKey(s)]
+  resetForClear(s)
+  s.sid = ''
   // /clear ends the conversation the window was armed for. A resume carries the window on to the next one, under its
   // id: the old id's keys go here, or a /keepwarm off there could never find them and the old session would re-arm them.
   if (reason === 'clear') {
-    await stop($, s, null)
+    s.deadline = 0
+    s.every = PING_AFTER_MS
     s.stopped = null
-  } else {
-    await $.store.delete(deadlineKey(s))
-    await $.store.delete(everyKey(s))
+    s.retries = 0
   }
-  resetForClear(s)
-  s.sid = ''
+  for (const key of keys) await $.store.delete(key)
+  if (reason === 'clear') updateStatus($, s, await $.clock.now())
 }
 
 /** Reads the session the process runs now: its id, its model and the engine's figures for its context. Returns the time read with them. */
@@ -472,7 +482,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     resumedAt: 0, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, preCompactWrites: null,
   }
 }
 
@@ -685,8 +695,8 @@ export const register: Register = on => {
     const u = r.usage
     if (!e.agentId && u) {
       const price = priceOf(u.model || e.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
-      const was = s.stepWrites ?? { usd: 0, priced: true }
-      s.stepWrites = { usd: was.usd + (price ? u.cache_creation_input_tokens * price[1] / 1e6 : 0), priced: was.priced && price != null }
+      const was = s.stepWrites ?? { tokens: 0, usd: 0, priced: true }
+      s.stepWrites = { tokens: was.tokens + u.cache_creation_input_tokens, usd: was.usd + (price ? u.cache_creation_input_tokens * price[1] / 1e6 : 0), priced: was.priced && price != null }
     }
     return r
   })
@@ -704,6 +714,7 @@ export const register: Register = on => {
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
     // A turn aborted before it sent anything touched no cache, so it leaves the clock alone.
     if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
+    const compacted = s.compacted
     s.compacted = false
     if (s.lastRequestAt) s.resumedAt = 0
     s.waitForTurn = false
@@ -724,14 +735,19 @@ export const register: Register = on => {
       // A turn's usage is its responses summed, so a ten-step turn reports ten
       // reads of the context. The live window is the engine's figure; the sum
       // is only the fallback for a host that reports no tokens.
-      const write = u.cache_creation_input_tokens
+      const written = u.cache_creation_input_tokens
       const live = (await $.session.usage()).context.tokens
-      s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + write
+      s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + written
+      // A compaction since the last complete turn: what followed it is the summary, no cold write, so the turn is scored
+      // on what the steps wrote before it. A host that reports no step usage leaves only the turn's total, an upper
+      // bound kept for a send the guard saw go cold and for nothing else.
+      const writes = compacted ? s.preCompactWrites : s.stepWrites
+      const write = !compacted ? written : writes ? writes.tokens : s.coldWritePending ? written : 0
       const full = prev > 20000 && write >= 0.5 * prev
       if (full || s.coldWritePending) {
         // Priced per request when the steps reported usage; otherwise at the tier of the context the comeback re-sent.
         const price = priceOf(s.lastModel, prev || s.ctx)
-        const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
+        const usd = writes?.priced ? writes.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
         const extend = s.deadline < now + AUTO_WARM_MS && s.offs === offs
         if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
@@ -741,6 +757,7 @@ export const register: Register = on => {
     }
     s.coldWritePending = false
     s.stepWrites = null
+    s.preCompactWrites = null
     await arm($, s)
     return r
   })

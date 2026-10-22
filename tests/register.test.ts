@@ -1501,15 +1501,15 @@ describe('/clear overlapping /keepwarm', () => {
     releaseClear()
     await clearing
     await settle()
-    // /clear cancelled the window's timer in its reset, so it must set a new one: the wake at the deadline,
-    // since the new conversation has no request yet.
-    expect(timers.length).toBe(beforeClearEnds + 1)
+    // /clear reset the state before it first awaited, so the window armed meanwhile kept its timer: the wake at the
+    // deadline, since the new conversation has no request yet. Nothing is cancelled or set again when /clear ends.
+    expect(timers.length).toBe(beforeClearEnds)
     expect(waits.at(-1)).toBe(6 * HOUR)
     // A wakes, finds the schedule changed and a timer in place, and sends nothing.
     releaseA()
     await settle()
     expect(w.forks.length).toBe(0)
-    expect(timers.length).toBe(beforeClearEnds + 1)
+    expect(timers.length).toBe(beforeClearEnds)
     // The first turn of the new conversation starts the pings as usual.
     await $.turn.complete(turn())
     now += 50 * MIN
@@ -2054,8 +2054,24 @@ describe('a managed plugin above the user tier', () => {
     await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
     await step($, 'after', 0, 3)
     expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/state       reset by compaction/)
-    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 10000 }) }))
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 150000 }) }))
     expect(w.logs).toEqual([])
+    expect(w.status.at(-1)).toBe(undefined)
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     0 cold writes paid/)
+  })
+
+  test('a summary written after a warm request in the same turn is no cold write', { plugins: [managed] }, async ($, on) => {
+    mock.clock(on, { now: START })
+    const w = world(on, [], { steps: [usage(), usage(), usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 150000 })] })
+    await $.session.start(session)
+    await step($, 'first', 0, 40)
+    await $.turn.complete(turn())
+    await step($, 'long', 0, 42)
+    await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
+    await step($, 'long', 1, 3)
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 200000, cache_creation_input_tokens: 150500 }) }))
+    expect(w.logs).toEqual([])
+    expect(w.status.at(-1)).toBe(undefined)
     expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     0 cold writes paid/)
   })
 
@@ -2071,14 +2087,14 @@ describe('a managed plugin above the user tier', () => {
 
   test('a cold write and a compaction in the same turn still score the write', async ($, on) => {
     const clock = mock.clock(on, { now: START })
-    const w = world(on, [])
+    const w = world(on, [], { steps: [usage(), usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }), usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 10000 })] })
     await $.session.start(session)
     await step($, 'first', 0, 40)
     await $.turn.complete(turn())
     await clock.advance(2 * HOUR)
     await step($, 'comeback', 0, 42)
     await step($, 'comeback', 1, 3)
-    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 210000 }) }))
     expect(w.logs.at(-1)).toMatch(/^cold write of 200k tokens paid \(\$4\.00\)/)
   })
 
@@ -2146,5 +2162,63 @@ describe('a managed plugin above the user tier', () => {
     expect(store.get('every:S2')).toBe(2 * MIN)
     await $.command.run(run('keepwarm', 'off'))
     expect([...store.keys()]).toEqual([])
+  })
+
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+  // Holds every delete of one key until released, in order, so two ends of the same conversation can be interleaved.
+  const holdDeletes = (key: string) => {
+    const waiting: Array<() => void> = []
+    return {
+      gate: async (op: 'get' | 'set' | 'delete', k: string) => { if (op === 'delete' && k === key) await new Promise<void>(r => { waiting.push(r) }) },
+      release: () => waiting.shift()?.(),
+      held: () => waiting.length,
+    }
+  }
+
+  test('a session.end that lands while the classic resume is still deleting the old keys cannot wipe the seeded clock', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let sid = 'S1'
+    const held = holdDeletes('deadline:S1')
+    const w = world(on, [], { store: new Map<string, unknown>(), sid: () => sid, live: { tokens: 200000 }, storeGate: held.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    sid = 'S2'
+    const resuming = $.classic.SessionStart({ session_id: 'S2', source: 'resume', seconds_since_last_response: 7200, context_tokens: 200000, prompt_cache_likely_expired: true })
+    await settle()
+    expect(held.held()).toBe(1)
+    const ending = end($, 'S1', 'resume')
+    await settle()
+    held.release()
+    await resuming
+    held.release()
+    await ending
+    expect(w.logs.length).toBe(1)
+    expect(w.logs[0]).toMatch(/^resuming cold/)
+    expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/went cold 1h00m ago/)
+    expect(w.logs.length).toBe(1)
+  })
+
+  test('an end cut short in its store cleanup has already dropped the old timer and id', { plugins: [managed] }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    let sid = 'S1'
+    const held = holdDeletes('deadline:S1')
+    const w = world(on, [warm], { store, sid: () => sid, storeGate: held.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    const ending = end($, 'S1', 'resume')
+    await settle()
+    expect(held.held()).toBe(1)
+    sid = 'S2'
+    // The old conversation's ping is due while its end is still waiting on the store; the transcript it would fork is gone.
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(0)
+    await $.prompt.submit(prompt('hi'))
+    expect(store.get('deadline:S2')).toBe(START + 3 * HOUR)
+    held.release()
+    await ending
+    expect(store.has('deadline:S1')).toBe(false)
   })
 })
