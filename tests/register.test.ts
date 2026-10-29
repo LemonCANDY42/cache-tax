@@ -2293,3 +2293,25 @@ test('the autoWarm option is on unless it is off', async () => {
   expect(autoWarmFrom({ autoWarm: 'on' })).toBe(true)
   expect(autoWarmFrom({ autoWarm: 'off' })).toBe(false)
 })
+
+// A consumer seated beside the mod: the way another plugin calls the noun. `register` closes over nothing of this file.
+const peek: Plugin = {
+  name: 'peek',
+  register(on) {
+    on('command.run', { command: 'peek' }, async $ => ({ text: JSON.stringify(await $.cacheTax.status()) }))
+  },
+}
+const peekCmd = { command: 'peek', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as unknown as CommandRunInput
+
+describe('$.cacheTax noun', () => {
+  test('status reads keepwarm off, then on with the window left', { plugins: [peek] }, async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const read = async () => JSON.parse(((await $.command.run(peekCmd)) as { text: string }).text)
+    expect(await read()).toMatchObject({ keepwarm: 'off', leftMs: 0, nextPingMs: null, cold: null, guard: 'refuse', coldWrites: 0 })
+    await $.command.run(run('keepwarm', '90m'))
+    await $.turn.complete(turn())
+    expect(await read()).toMatchObject({ keepwarm: 'on', leftMs: 90 * MIN, cold: false })
+  })
+})
