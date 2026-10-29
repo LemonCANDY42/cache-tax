@@ -6,6 +6,10 @@ const PING_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
 const MAX_RETRIES = 3
 const AUTO_WARM_MS = 3 * 60 * 60 * 1000
+/** The "Auto keepwarm" option: whether a paid cold write arms keepwarm for three hours by itself. Set in register. */
+let autoWarm = true
+/** Reads the "autoWarm" option: anything but "off" keeps the default, on. */
+export const autoWarmFrom = (options: Record<string, unknown> | undefined): boolean => options?.autoWarm !== 'off'
 const DEFAULT_WINDOW_MS = 6 * 60 * 60 * 1000
 const BIG_TOKENS = 50000
 const PING_PROMPT = 'Reply with the single word: warm'
@@ -430,6 +434,11 @@ function afterRetries(n: number): string {
 
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
 /** How long keepwarm holds the cache after a paid cold write: the rolling window when always is on. */
+/** What the guard says about keepwarm after a paid cold write; `then` is the wording of the refusal. */
+function holdNote(s: State, then: boolean): string {
+  if (!autoWarm && !s.always) return 'keepwarm stays off (/keepwarm to arm it)'
+  return then ? `keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}` : `keepwarm will hold the cache for ${fmtDuration(holdMs(s))} once it lands`
+}
 function holdMs(s: State): number {
   return s.always ? DEFAULT_WINDOW_MS : AUTO_WARM_MS
 }
@@ -494,7 +503,8 @@ export function freshState(): State {
   }
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  autoWarm = autoWarmFrom(options)
   const s = freshState()
   let light = false
   let noColor = false
@@ -673,7 +683,7 @@ export const register: Register = on => {
     // A refused prompt that no person sent would be lost: nobody is there to send it again.
     const unattended = UNATTENDED.has(e.origin.kind)
     if (s.guard === 'warn' || unattended) {
-      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(holdMs(s))} once it lands.`)
+      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; ${holdNote(s, false)}.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -683,7 +693,7 @@ export const register: Register = on => {
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
+    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and ${holdNote(s, true)}. Or /clear and start from a note.` }
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -759,7 +769,7 @@ export const register: Register = on => {
         const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = writes?.priced ? writes.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
-        const extend = s.deadline < now + AUTO_WARM_MS && s.offs === offs
+        const extend = autoWarm && s.deadline < now + AUTO_WARM_MS && s.offs === offs
         if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
         $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` +
           (extend ? ` Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.` : ''))

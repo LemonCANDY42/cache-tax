@@ -2284,3 +2284,12 @@ describe('a managed plugin above the user tier', () => {
     expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     0 cold writes paid/)
   })
 })
+
+import { autoWarmFrom } from '../hooks/register'
+
+test('the autoWarm option is on unless it is off', async () => {
+  expect(autoWarmFrom(undefined)).toBe(true)
+  expect(autoWarmFrom({})).toBe(true)
+  expect(autoWarmFrom({ autoWarm: 'on' })).toBe(true)
+  expect(autoWarmFrom({ autoWarm: 'off' })).toBe(false)
+})

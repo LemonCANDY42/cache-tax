@@ -32,6 +32,14 @@ In a warm session, run `/keepwarm` to arm six hours. Use `/keepwarm 90m` for a s
 
 **Prefer a settings hook?** The [hook version](https://github.com/karanb192/claude-code-hooks/tree/main/plugins/cache-tax) warns by default, refuses once with `CACHE_TAX_BLOCK=1`, and provides a standalone status-line countdown. Warming is part of this mod.
 
+## Options
+
+In `/config`, under cache-tax:
+
+    Auto keepwarm:  on | off
+
+`on` (the default) keeps today's behavior: after you pay a cold cache write, keepwarm arms itself for three hours. `off` leaves keepwarm alone until you arm it with `/keepwarm`; the guard's wording then says keepwarm stays off. `/keepwarm always` still arms it either way.
+
 ## How it works
 
 **Before a break:** `/keepwarm` arms a bounded window. After 50 idle minutes, a timer inside Claude Code sends one tool-less fork over the session's transcript. It reads usage after every ping and stops if reads are zero or writes reach 10% of reads. There is no background transcript-polling loop.
